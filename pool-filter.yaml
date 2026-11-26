@@ -1,0 +1,207 @@
+# =============================================================================
+# ESPHome — Aibo / Likebo sand filter head (pool filter valve, 6 positions)
+#
+# Прямое управление головкой песочного фильтра по RS485 (Modbus RTU, unit id 1).
+# Плата: ESP32-S3. Требуется ESPHome 2026.x (действия modbus_client.*).
+#
+# Перед первой сборкой создайте secrets.yaml (или задайте значения в HA):
+#   wifi_ssid, wifi_password, api_key
+# =============================================================================
+
+substitutions:
+  # Пины RS485-трансивера на ESP32-S3 (по умолчанию как на плате этого проекта)
+  rs485_tx_pin: "8"
+  rs485_rx_pin: "9"
+  # Скорость RS485-стороны головки/моста. 19200 8N1 — значение, проверенное на ABF-24010018.
+  rs485_baud: "19200"
+  # Опрос регистров (давление, позиция, уставка) — раз в минуту.
+  poll_interval: "60s"
+  # Wake за 1 с до опроса (меньше poll_interval на 1 секунду).
+  wake_interval: "59s"
+  # Диапазон уставки давления промывки, кПа — из конфига головки (0..230).
+  trigger_min: "0"
+  trigger_max: "230"
+
+esphome:
+  name: pool-filter-head
+  friendly_name: Pool filter head
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Раскомментируйте, если сеть не broadcast-ится или нужно подключаться по IP:
+  # fast_connect: true
+  # manual_ip:
+  #   static_ip: 192.168.1.120
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+
+uart:
+  - id: filter_uart
+    tx_pin: ${rs485_tx_pin}
+    rx_pin: ${rs485_rx_pin}
+    baud_rate: ${rs485_baud}
+    data_bits: 8
+    parity: NONE          # Modbus RTU = 8N1
+    stop_bits: 1
+
+modbus:
+  - id: filter_modbus_hub
+    uart_id: filter_uart
+    role: client
+    send_wait_time: 1500ms   # головка отвечает быстро; приложение использовало таймаут ~300 мс
+
+modbus_controller:
+  - id: filter_controller
+    modbus_id: filter_modbus_hub
+    address: 0x01            # все кадры головки идут на unit id 1
+    update_interval: ${poll_interval}
+    max_cmd_retries: 2
+    # Головка спит и не отвечает на чтение: опрос раз в 2 цикла. Записи (в т.ч. wake) идут и так.
+    offline_skip_updates: 1
+    on_online:
+      then:
+        - binary_sensor.template.publish:
+            id: head_online
+            state: ON
+    on_offline:
+      then:
+        - binary_sensor.template.publish:
+            id: head_online
+            state: OFF
+
+time:
+  # Время из Home Assistant (с таймзоной HA) — нужно для синхронизации часов головки
+  - platform: homeassistant
+    id: ha_clock
+
+output:
+  # Пробуждение головки: регистр 0x0004 = 10 (FC 06) = кадр 01 06 00 04 00 0A 48 0C.
+  # Только запись, в HA не публикуется.
+  - platform: modbus_controller
+    modbus_controller_id: filter_controller
+    id: head_wake
+    address: 0x0004
+    register_type: holding
+    value_type: U_WORD
+
+interval:
+  # Пробуждение за 1 с до опроса: сначала wake, потом чтение.
+  - interval: ${wake_interval}
+    then:
+      - lambda: |-
+          id(head_wake).set_level(10);
+
+select:
+  # 6 позиций головки: запись 0x0014 (FC 06). Фактическое положение читается из 0x0013.
+  - platform: modbus_controller
+    modbus_controller_id: filter_controller
+    id: filter_mode
+    name: "Pool filter mode"
+    address: 0x0014
+    value_type: U_WORD
+    optimistic: true
+    # Перед записью режима отправляется wake (встаёт в очередь хаба раньше кадра записи).
+    write_lambda: |-
+      id(head_wake).set_level(10);
+      return value;
+    optionsmap:
+      "Filter": 1
+      "Backwash": 2
+      "Bottom pipe flushing": 3
+      "No filter drainage": 4
+      "No filter cycle": 5
+      "Closed": 6
+
+number:
+  # Порог промывки по давлению, кПа (запись 0x0017).
+  - platform: modbus_controller
+    modbus_controller_id: filter_controller
+    name: "Backwash pressure trigger"
+    address: 0x0017
+    register_type: holding
+    value_type: U_WORD
+    # Перед записью уставки отправляется wake.
+    write_lambda: |-
+      id(head_wake).set_level(10);
+      return x;
+    min_value: ${trigger_min}
+    max_value: ${trigger_max}
+    step: 1
+    unit_of_measurement: "kPa"
+
+sensor:
+  # Давление в фильтре, кПа (read-only регистр 0x0018, кадр 01 03 00 18 00 01)
+  - platform: modbus_controller
+    modbus_controller_id: filter_controller
+    name: "Pool filter pressure"
+    address: 0x0018
+    register_type: holding
+    value_type: U_WORD
+    unit_of_measurement: "kPa"
+    state_class: measurement
+    device_class: pressure
+    accuracy_decimals: 0
+
+  # Фактическая позиция головки, регистр 0x0013 (кадр 01 03 00 13 00 01), 1..6
+  - platform: modbus_controller
+    modbus_controller_id: filter_controller
+    name: "Pool filter position (1-6)"
+    address: 0x0013
+    register_type: holding
+    value_type: U_WORD
+    icon: "mdi:tube"
+    accuracy_decimals: 0
+
+binary_sensor:
+  # Головка отвечает на Modbus (false = спит/не в сети/нет кабеля)
+  - platform: template
+    name: "Filter head online"
+    id: head_online
+    device_class: connectivity
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart ESP32"
+
+  # Синхронизация часов головки: FC 16 на 0x0020, 3 регистра =
+  # (год, месяц), (день, час), (минута, секунда). Wake отправляется первым кадром.
+  - platform: template
+    name: "Sync filter head clock"
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(ha_clock).now().is_valid();'
+          then:
+            - modbus_client.write_single_register:
+                modbus_id: filter_modbus_hub
+                address: 0x01
+                start_address: 0x0004
+                value: 0x000A
+            - modbus_client.write_multiple_registers:
+                modbus_id: filter_modbus_hub
+                address: 0x01
+                start_address: 0x0020
+                values: !lambda |-
+                  auto t = id(ha_clock).now();
+                  std::vector<uint16_t> v;
+                  v.push_back(((t.year % 100) << 8) | t.month);
+                  v.push_back((t.day_of_month << 8) | t.hour);
+                  v.push_back((t.minute << 8) | t.second);
+                  return v;
